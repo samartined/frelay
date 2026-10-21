@@ -25,6 +25,11 @@ final class BleTransport implements Transport {
     private volatile BluetoothGatt gatt;
     private volatile boolean closed;
     private volatile int mtu = 23;
+    /**
+     * Set when the Flipper dropped the link during MTU negotiation; later attempts in this relay run
+     * keep the default MTU (slower, but works). Reset by RelayService when the user presses Start.
+     */
+    static volatile boolean skipMtu;
     private int credits;
     private BluetoothGattCharacteristic tx;
     BleTransport(Context context, String address, Listener listener) {
@@ -32,6 +37,8 @@ final class BleTransport implements Transport {
     }
     private final BluetoothGattCallback callback = new BluetoothGattCallback() {
         @Override public void onConnectionStateChange(BluetoothGatt g, int status, int state) {
+            Diagnostics.add("GATT conexión: estado=" + stateName(state) + " status=" + status
+                    + (status != 0 ? " (" + GattEvents.hint(status) + ")" : ""));
             if (closed) return;
             if (status == BluetoothGatt.GATT_SUCCESS && state == BluetoothProfile.STATE_CONNECTED)
                 events.offer("connect", status);
@@ -41,14 +48,22 @@ final class BleTransport implements Transport {
                 synchronized (creditLock) { creditLock.notifyAll(); }
             }
         }
-        @Override public void onServicesDiscovered(BluetoothGatt g, int status) { events.offer("services", status); }
+        @Override public void onServicesDiscovered(BluetoothGatt g, int status) {
+            Diagnostics.add("GATT servicios descubiertos: status=" + status);
+            events.offer("services", status);
+        }
         @Override public void onMtuChanged(BluetoothGatt g, int value, int status) {
+            Diagnostics.add("GATT MTU=" + value + " status=" + status);
             if (status == 0) mtu = value;
             events.offer("mtu", 0); // The default MTU remains usable if negotiation fails.
         }
-        @Override public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) { events.offer("subscribe", status); }
+        @Override public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) {
+            Diagnostics.add("GATT suscripción " + d.getCharacteristic().getUuid() + ": status=" + status);
+            events.offer("subscribe", status);
+        }
         @Override public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) { events.offer("write", status); }
         @Override public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic c, int status) {
+            Diagnostics.add("GATT lectura buffer: status=" + status);
             if (status == 0 && c.getUuid().equals(FLOW)) updateCredits(c.getValue());
             events.offer("read", status);
         }
@@ -65,6 +80,23 @@ final class BleTransport implements Transport {
         if (n < 0 || n > 65536) { listener.failed("Tamaño de buffer BLE no válido"); return; }
         synchronized (creditLock) { credits = n; creditLock.notifyAll(); }
     }
+    private static String stateName(int state) {
+        switch (state) {
+            case BluetoothProfile.STATE_CONNECTED: return "conectado";
+            case BluetoothProfile.STATE_CONNECTING: return "conectando";
+            case BluetoothProfile.STATE_DISCONNECTING: return "desconectando";
+            case BluetoothProfile.STATE_DISCONNECTED: return "desconectado";
+            default: return String.valueOf(state);
+        }
+    }
+    private static String bondName(int bond) {
+        switch (bond) {
+            case BluetoothDevice.BOND_BONDED: return "emparejado";
+            case BluetoothDevice.BOND_BONDING: return "emparejando";
+            case BluetoothDevice.BOND_NONE: return "no emparejado";
+            default: return String.valueOf(bond);
+        }
+    }
     private void await(String kind, int seconds) throws Exception {
         if (closed) throw new IOException("BLE detenido");
         events.await(kind, TimeUnit.SECONDS.toMillis(seconds));
@@ -74,6 +106,8 @@ final class BleTransport implements Transport {
         if (adapter == null || !adapter.isEnabled()) throw new IOException("Activa el Bluetooth del móvil");
         if (!BluetoothAdapter.checkBluetoothAddress(address)) throw new IOException("Selecciona un dispositivo Bluetooth en la lista");
         BluetoothDevice device = adapter.getRemoteDevice(address);
+        Diagnostics.add("BLE inicio: " + address + " nombre=" + device.getName() + " tipo=" + device.getType()
+                + " vínculo=" + bondName(device.getBondState()) + " omitirMTU=" + skipMtu);
         if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
             listener.stage("Emparejando con " + address + ": confirma el código en el móvil y en el Flipper");
             if (device.getBondState() != BluetoothDevice.BOND_BONDING && !device.createBond())
@@ -89,9 +123,33 @@ final class BleTransport implements Transport {
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE);
         if (gatt == null) throw new IOException("No se pudo abrir la conexión BLE");
         await("connect", 20);
-        gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); // screen streaming throughput
-        listener.stage("Negociando MTU");
-        if (gatt.requestMtu(247)) await("mtu", 10);
+        // Like the official app (BleDeviceConnectionApiImpl: connect, waitForBonding, requestMtu): let the
+        // Flipper finish its security request (pairing/encryption) before any other GATT operation.
+        listener.stage("Esperando cifrado y vínculo con el Flipper");
+        Thread.sleep(600);
+        long bondDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (!closed && device.getBondState() == BluetoothDevice.BOND_BONDING && System.nanoTime() < bondDeadline)
+            Thread.sleep(200);
+        Diagnostics.add("BLE tras conectar: vínculo=" + bondName(device.getBondState()));
+        if (closed) throw new IOException("BLE detenido");
+        if (device.getBondState() != BluetoothDevice.BOND_BONDED)
+            throw new IOException("El Flipper no completó el emparejamiento: bórralo de los dispositivos Bluetooth del móvil y del Flipper, y vuelve a emparejar");
+        if (skipMtu) {
+            Diagnostics.add("BLE: se omite la negociación de MTU (MTU 23)");
+        } else {
+            listener.stage("Negociando MTU");
+            if (gatt.requestMtu(247)) {
+                try {
+                    await("mtu", 10);
+                } catch (IOException e) {
+                    skipMtu = true;
+                    Diagnostics.add("BLE: falló el MTU, el próximo intento no lo negociará");
+                    throw new IOException(e.getMessage() + ". El próximo intento no negociará el MTU.");
+                }
+            } else {
+                Diagnostics.add("BLE: requestMtu devolvió false");
+            }
+        }
         listener.stage("Descubriendo servicios del Flipper");
         if (!gatt.discoverServices()) throw new IOException("No se pudo iniciar el descubrimiento de servicios BLE");
         await("services", 15);

@@ -40,7 +40,12 @@ public final class RelayService extends Service {
         status = message;
         if (running) getSystemService(NotificationManager.class).notify(42, notification(message));
     }
+    static String appVersion(Context context) {
+        try { return context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName; }
+        catch (Exception e) { return "?"; }
+    }
     private void fail(String stage, String message) {
+        Diagnostics.add("Error en " + ("server".equals(stage) ? "servidor" : "Flipper") + ": " + message);
         lastError = message; lastErrorAt = System.currentTimeMillis();
         if ("server".equals(stage)) serverStage = "Error"; else flipperStage = "Error";
         update(message);
@@ -50,6 +55,8 @@ public final class RelayService extends Service {
         if (intent == null || "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
         if (running) return START_NOT_STICKY;
         serverStage = "—"; flipperStage = "—"; relayStage = "Arrancando"; lastError = null; attempt = 0; nextRetryAt = 0;
+        BleTransport.skipMtu = false;
+        Diagnostics.add("Relé iniciado: app " + appVersion(this) + ", Android " + Build.VERSION.RELEASE + ", " + Build.MANUFACTURER + " " + Build.MODEL);
         getSystemService(NotificationManager.class).createNotificationChannel(
                 new NotificationChannel(CHANNEL, "Flipper connection", NotificationManager.IMPORTANCE_LOW));
         startForeground(42, notification("Conectando"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
@@ -107,6 +114,7 @@ public final class RelayService extends Service {
                 if (!healthy.get())
                     throw new IOException(serverFailure[0] != null ? serverFailure[0] : ServerErrors.describe(-1, null, target));
                 serverStage = "Conectado a " + target;
+                Diagnostics.add("Servidor conectado: " + target + " (intento " + attempt + ")");
                 stage = "flipper";
                 Transport.Listener listener = new Transport.Listener() {
                     public void bytes(byte[] data) {
@@ -138,6 +146,7 @@ public final class RelayService extends Service {
                     throw new IOException("El servidor se desconectó");
                 flipperStage = "Conectado por " + mode; relayStage = "Activo";
                 update("Activo: Flipper conectado por " + mode); failures = 0;
+                Diagnostics.add("Relé activo por " + mode);
                 while (running && healthy.get()) {
                     byte[] next = writes.poll(500, TimeUnit.MILLISECONDS);
                     if (next != null) {

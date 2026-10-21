@@ -31,7 +31,7 @@ public final class MainActivity extends Activity {
     private final LinkedHashMap<String, Devices.Entry> devices = new LinkedHashMap<>();
     private EditText url, token;
     private Spinner mode;
-    private TextView selected, searchStatus, serverLine, flipperLine, relayLine, errorLine;
+    private TextView selected, searchStatus, serverLine, flipperLine, relayLine, errorLine, diagnostics;
     private RadioGroup deviceList;
     private BluetoothLeScanner scanner;
     private boolean receiverRegistered, renderPending;
@@ -111,6 +111,9 @@ public final class MainActivity extends Activity {
         button(layout, "Parar relé", () -> stopService(new Intent(this, RelayService.class)));
         serverLine = label(layout, ""); flipperLine = label(layout, ""); relayLine = label(layout, "");
         errorLine = label(layout, ""); errorLine.setTextColor(Color.rgb(190, 30, 30));
+        section(layout, "Diagnóstico");
+        diagnostics = label(layout, ""); diagnostics.setTextSize(12); diagnostics.setTypeface(Typeface.MONOSPACE);
+        button(layout, "Copiar diagnóstico", this::copyDiagnostics);
         label(layout, "BLE: activa el Bluetooth del Flipper, cierra la app oficial de Flipper y confirma el emparejamiento si se pide.\n\n"
                 + "USB: usa un cable USB-C de datos y acepta el permiso USB. Tras cambiar de cable o de modo, pulsa Iniciar otra vez.");
 
@@ -231,8 +234,20 @@ public final class MainActivity extends Activity {
         long wait = RelayService.nextRetryAt - System.currentTimeMillis();
         if (RelayService.active && wait > 0) relay += "  ·  reintento en " + (wait / 1000 + 1) + " s";
         relayLine.setText(relay);
+        java.util.List<String> lines = Diagnostics.tail(10);
+        diagnostics.setText(lines.isEmpty() ? "Sin eventos todavía." : String.join("\n", lines));
         String error = RelayService.lastError;
         errorLine.setText(error == null ? "" : "Último error (" + new SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(new Date(RelayService.lastErrorAt)) + "): " + error);
+    }
+
+    private void copyDiagnostics() {
+        String text = "Flipper Relay " + RelayService.appVersion(this) + ", Android " + Build.VERSION.RELEASE
+                + " (API " + Build.VERSION.SDK_INT + "), " + Build.MANUFACTURER + " " + Build.MODEL + "\n"
+                + "Modo: " + currentMode() + ", seleccionado: " + prefs.getString(key() + "_name", "?") + " " + prefs.getString(key(), "") + "\n"
+                + "Servidor: " + RelayService.serverStage + "\nFlipper: " + RelayService.flipperStage + "\nRelé: " + RelayService.relayStage + "\n"
+                + "Último error: " + RelayService.lastError + "\n\n" + Diagnostics.dump();
+        getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("Diagnóstico Flipper Relay", text));
+        Toast.makeText(this, "Diagnóstico copiado (sin tokens). Pégalo donde lo necesites.", Toast.LENGTH_LONG).show();
     }
 
     // ---------------------------------------------------------------- server test
