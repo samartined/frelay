@@ -7,7 +7,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.UUID;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /** UUIDs and big-endian buffer credits follow the upstream Flipper Android bridge. */
@@ -18,11 +17,10 @@ final class BleTransport implements Transport {
     private static final UUID TX = UUID.fromString("19ed82ae-ed21-4c9d-4145-228e62fe0000");
     private static final UUID FLOW = UUID.fromString("19ed82ae-ed21-4c9d-4145-228e63fe0000");
     private static final UUID CCC = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-    private record Event(String kind, int status) {}
     private final Context context;
     private final String address;
     private final Listener listener;
-    private final LinkedBlockingQueue<Event> events = new LinkedBlockingQueue<>();
+    private final GattEvents events = new GattEvents();
     private final Object creditLock = new Object();
     private volatile BluetoothGatt gatt;
     private volatile boolean closed;
@@ -36,23 +34,23 @@ final class BleTransport implements Transport {
         @Override public void onConnectionStateChange(BluetoothGatt g, int status, int state) {
             if (closed) return;
             if (status == BluetoothGatt.GATT_SUCCESS && state == BluetoothProfile.STATE_CONNECTED)
-                events.offer(new Event("connect", status));
+                events.offer("connect", status);
             else if (state == BluetoothProfile.STATE_DISCONNECTED || status != 0) {
-                events.offer(new Event("disconnect", status));
-                listener.failed("BLE disconnected (status " + status + ")");
+                events.offer(GattEvents.DISCONNECT, status);
+                listener.failed("Flipper desconectado: " + GattEvents.hint(status));
                 synchronized (creditLock) { creditLock.notifyAll(); }
             }
         }
-        @Override public void onServicesDiscovered(BluetoothGatt g, int status) { events.offer(new Event("services", status)); }
+        @Override public void onServicesDiscovered(BluetoothGatt g, int status) { events.offer("services", status); }
         @Override public void onMtuChanged(BluetoothGatt g, int value, int status) {
             if (status == 0) mtu = value;
-            events.offer(new Event("mtu", 0)); // The default MTU remains usable if negotiation fails.
+            events.offer("mtu", 0); // The default MTU remains usable if negotiation fails.
         }
-        @Override public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) { events.offer(new Event("subscribe", status)); }
-        @Override public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) { events.offer(new Event("write", status)); }
+        @Override public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) { events.offer("subscribe", status); }
+        @Override public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic c, int status) { events.offer("write", status); }
         @Override public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic c, int status) {
             if (status == 0 && c.getUuid().equals(FLOW)) updateCredits(c.getValue());
-            events.offer(new Event("read", status));
+            events.offer("read", status);
         }
         @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) {
             byte[] data = c.getValue();
@@ -62,76 +60,81 @@ final class BleTransport implements Transport {
         }
     };
     private void updateCredits(byte[] value) {
-        if (value == null || value.length != 4) { listener.failed("Invalid BLE flow-control value"); return; }
+        if (value == null || value.length != 4) { listener.failed("Valor de control de flujo BLE no válido"); return; }
         int n = ByteBuffer.wrap(value).getInt();
-        if (n < 0 || n > 65536) { listener.failed("Invalid BLE buffer size"); return; }
+        if (n < 0 || n > 65536) { listener.failed("Tamaño de buffer BLE no válido"); return; }
         synchronized (creditLock) { credits = n; creditLock.notifyAll(); }
     }
     private void await(String kind, int seconds) throws Exception {
-        Event event = events.poll(seconds, TimeUnit.SECONDS);
-        if (closed || event == null) throw new IOException("BLE " + kind + " timed out or stopped");
-        if (!kind.equals(event.kind) || event.status != 0)
-            throw new IOException("BLE " + kind + " failed: " + event.kind + "/" + event.status);
+        if (closed) throw new IOException("BLE detenido");
+        events.await(kind, TimeUnit.SECONDS.toMillis(seconds));
     }
     @Override public void open() throws Exception {
         BluetoothAdapter adapter = context.getSystemService(BluetoothManager.class).getAdapter();
-        if (adapter == null || !adapter.isEnabled()) throw new IOException("Enable Bluetooth on the phone");
+        if (adapter == null || !adapter.isEnabled()) throw new IOException("Activa el Bluetooth del móvil");
+        if (!BluetoothAdapter.checkBluetoothAddress(address)) throw new IOException("Selecciona un dispositivo Bluetooth en la lista");
         BluetoothDevice device = adapter.getRemoteDevice(address);
         if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
+            listener.stage("Emparejando con " + address + ": confirma el código en el móvil y en el Flipper");
             if (device.getBondState() != BluetoothDevice.BOND_BONDING && !device.createBond())
-                throw new IOException("Could not start pairing");
+                throw new IOException("No se pudo iniciar el emparejamiento");
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
             while (!closed && device.getBondState() != BluetoothDevice.BOND_BONDED && System.nanoTime() < deadline)
                 Thread.sleep(200);
             if (closed || device.getBondState() != BluetoothDevice.BOND_BONDED)
-                throw new IOException("Pairing not completed; confirm the code on phone and Flipper");
+                throw new IOException("Emparejamiento no completado: confirma el código en el móvil y en el Flipper");
         }
-        if (closed) throw new IOException("Stopped");
+        if (closed) throw new IOException("BLE detenido");
+        listener.stage("Conectando por BLE a " + address);
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE);
-        if (gatt == null) throw new IOException("Could not open BLE");
+        if (gatt == null) throw new IOException("No se pudo abrir la conexión BLE");
         await("connect", 20);
+        gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); // screen streaming throughput
+        listener.stage("Negociando MTU");
         if (gatt.requestMtu(247)) await("mtu", 10);
-        if (!gatt.discoverServices()) throw new IOException("Cannot discover BLE services");
+        listener.stage("Descubriendo servicios del Flipper");
+        if (!gatt.discoverServices()) throw new IOException("No se pudo iniciar el descubrimiento de servicios BLE");
         await("services", 15);
         BluetoothGattService service = gatt.getService(SERVICE);
-        if (service == null) throw new IOException("Flipper RPC BLE service is missing");
+        if (service == null) throw new IOException("El dispositivo no ofrece el servicio RPC del Flipper: ¿es el Flipper correcto?");
         BluetoothGattCharacteristic rx = service.getCharacteristic(RX);
         tx = service.getCharacteristic(TX);
         BluetoothGattCharacteristic flow = service.getCharacteristic(FLOW);
-        if (rx == null || tx == null || flow == null) throw new IOException("Flipper serial characteristics are missing");
+        if (rx == null || tx == null || flow == null) throw new IOException("Faltan las características serie del Flipper");
+        listener.stage("Suscribiendo a notificaciones");
         subscribe(rx); subscribe(flow);
-        if (!gatt.readCharacteristic(flow)) throw new IOException("Cannot read BLE buffer size");
+        if (!gatt.readCharacteristic(flow)) throw new IOException("No se pudo leer el buffer BLE del Flipper");
         await("read", 10);
     }
     private void subscribe(BluetoothGattCharacteristic c) throws Exception {
-        if (!gatt.setCharacteristicNotification(c, true)) throw new IOException("Cannot enable BLE notifications");
+        if (!gatt.setCharacteristicNotification(c, true)) throw new IOException("No se pudieron activar las notificaciones BLE");
         BluetoothGattDescriptor descriptor = c.getDescriptor(CCC);
-        if (descriptor == null) throw new IOException("BLE CCC descriptor missing");
+        if (descriptor == null) throw new IOException("Falta el descriptor CCC BLE");
         descriptor.setValue((c.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
                 ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE : BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
-        if (!gatt.writeDescriptor(descriptor)) throw new IOException("Cannot subscribe to BLE notifications");
+        if (!gatt.writeDescriptor(descriptor)) throw new IOException("No se pudo suscribir a las notificaciones BLE");
         await("subscribe", 10);
     }
     @Override public void write(byte[] data) throws Exception {
         int offset = 0;
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
         while (offset < data.length) {
-            if (closed) throw new IOException("BLE stopped");
+            if (closed) throw new IOException("BLE detenido");
             int count;
             synchronized (creditLock) {
                 while (credits == 0 && !closed) {
                     long remaining = deadline - System.nanoTime();
-                    if (remaining <= 0) throw new IOException("BLE flow control timed out");
+                    if (remaining <= 0) throw new IOException("Tiempo agotado en el control de flujo BLE");
                     TimeUnit.NANOSECONDS.timedWait(creditLock, remaining);
                 }
-                if (closed) throw new IOException("BLE stopped");
+                if (closed) throw new IOException("BLE detenido");
                 count = Math.min(Math.min(mtu - 3, 244), Math.min(credits, data.length - offset));
                 credits -= count;
             }
             tx.setWriteType((tx.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
                     ? BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT : BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
             tx.setValue(Arrays.copyOfRange(data, offset, offset + count));
-            if (!gatt.writeCharacteristic(tx)) throw new IOException("BLE write rejected");
+            if (!gatt.writeCharacteristic(tx)) throw new IOException("Escritura BLE rechazada");
             await("write", 10);
             offset += count;
         }
@@ -139,7 +142,7 @@ final class BleTransport implements Transport {
     @Override public void close() {
         closed = true;
         synchronized (creditLock) { creditLock.notifyAll(); }
-        events.offer(new Event("closed", -1));
+        events.offer(GattEvents.CLOSED, -1);
         BluetoothGatt g = gatt;
         if (g != null) { try { g.disconnect(); g.close(); } catch (SecurityException ignored) {} }
     }
